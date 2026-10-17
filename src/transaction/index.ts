@@ -407,6 +407,7 @@ export {
 export type {
   TimeBounds,
   TimeLockExecutionStatus,
+  TimeLockTransactionOptions,
 } from "./timeLocks";
 
 // ─── Webhook support (#208, #395) ─────────────────────────────────────────────

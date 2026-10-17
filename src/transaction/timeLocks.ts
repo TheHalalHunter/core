@@ -1,257 +1,163 @@
 /**
- * Time-locked transaction scheduling and execution (#587).
+ * Time-locked transaction utilities (#587, #725).
  *
- * Provides time-lock support for scheduling transactions to execute at
- * specific future times using Stellar time bounds (ledger close time).
+ * buildTimeLockTransaction fetches the real account sequence from Horizon
+ * (or accepts a caller-supplied sequence) and builds a BumpSequence transaction
+ * with the requested time bounds, returning unsigned XDR.
+ *
+ * validateTimeBounds and getTimeLockedTransactionStatus are pure helpers with
+ * no network I/O.
  */
 
 import {
-  BASE_FEE,
+  Account,
+  Horizon,
+  Operation,
   TransactionBuilder,
+  BASE_FEE,
 } from "@stellar/stellar-sdk";
 import { ok, err, SorokitErrorCode } from "../shared/response";
 import type { SorokitResult } from "../shared/response";
+import { toMessage } from "../shared";
+import { DEFAULT_TX_TIMEOUT_SECONDS } from "../shared/constants";
 import type { ResolvedNetworkConfig } from "../shared/types";
 
+// ─── Types ────────────────────────────────────────────────────────────────────
+
 /**
- * Time bounds configuration for a time-locked transaction.
+ * Inclusive time bounds for a Stellar transaction.
+ * Both fields are Unix timestamps in seconds.
+ * maxTime === 0 means no upper bound.
  */
 export interface TimeBounds {
+  /** Earliest time the transaction is valid (Unix seconds). 0 = no lower bound. */
   minTime: number;
+  /** Latest time the transaction is valid (Unix seconds). 0 = no upper bound. */
   maxTime: number;
 }
 
 /**
- * Time-lock execution eligibility check result.
+ * Status of a time-locked transaction evaluated against a given timestamp.
  */
-export interface TimeLockExecutionStatus {
-  canExecute: boolean;
-  currentTime: number;
-  minTime: number;
-  maxTime: number;
-  timeUntilExecutable: number;
-  timeRemaining: number;
-  reason?: string;
+export type TimeLockExecutionStatus =
+  | "pending"     // current time is before minTime
+  | "executable"  // current time is within [minTime, maxTime]
+  | "expired"     // current time is after maxTime (and maxTime !== 0)
+  | "invalid";    // time bounds are logically invalid (e.g. minTime > maxTime)
+
+/**
+ * Options for buildTimeLockTransaction.
+ */
+export interface TimeLockTransactionOptions {
+  timeBounds: TimeBounds;
+  /**
+   * Pre-fetched sequence number. When supplied, no Horizon round-trip is made.
+   * Must be the current on-chain sequence (TransactionBuilder increments by 1).
+   */
+  sequence?: string;
+  /** Override the transaction fee in stroops. Defaults to BASE_FEE. */
+  fee?: string;
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function isValidTimeBounds(timeBounds: TimeBounds): boolean {
+  if (timeBounds.minTime < 0 || timeBounds.maxTime < 0) return false;
+  if (timeBounds.maxTime !== 0 && timeBounds.minTime > timeBounds.maxTime) return false;
+  return true;
+}
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+/**
+ * Validate that a TimeBounds object is logically consistent.
+ * Returns true when valid, false otherwise.
+ */
+export function validateTimeBounds(timeBounds: TimeBounds): boolean {
+  return isValidTimeBounds(timeBounds);
 }
 
 /**
- * Build a time-locked transaction with min/max time bounds.
- *
- * Uses Stellar time bounds (ledger close time in seconds) to restrict
- * when the transaction can be executed.
- *
- * @param source - Source account public key (G... address)
- * @param operations - Transaction operations to add
- * @param timeBounds - Min and max times (seconds since epoch)
- * @param networkPassphrase - Network passphrase
- * @param baseFee - Per-operation fee in stroops (defaults to BASE_FEE)
- * @returns A SorokitResult containing the unsigned transaction XDR
- *
- * @example
- * const futureTime = Math.floor(Date.now() / 1000) + 3600; // 1 hour
- * const tx = await buildTimeLockTransaction(source, operations, {
- *   minTime: futureTime,
- *   maxTime: futureTime + 86400, // valid for 24h
- * }, networkPassphrase);
- */
-export function buildTimeLockTransaction(
-  source: string,
-  operations: any[],
-  timeBounds: TimeBounds,
-  networkPassphrase: string,
-  baseFee?: string | number,
-): SorokitResult<string> {
-  // Accept any non-empty string for source — let TransactionBuilder surface
-  // build errors (TX_BUILD_FAILED) instead of returning INVALID_ADDRESS for
-  // test placeholder keys that are not valid Stellar G-addresses.
-  if (!source || typeof source !== "string") {
-    return err(
-      SorokitErrorCode.INVALID_ADDRESS,
-      `Invalid source account address: ${String(source)}. Expected G... address.`,
-    );
-  }
-
-  if (!Array.isArray(operations) || operations.length === 0) {
-    return err(
-      SorokitErrorCode.INVALID_TRANSACTION,
-      "Operations array must be non-empty",
-    );
-  }
-
-  if (!networkPassphrase || typeof networkPassphrase !== "string") {
-    return err(
-      SorokitErrorCode.INVALID_NETWORK,
-      "Network passphrase must be a non-empty string",
-    );
-  }
-
-  // Use === undefined so that 0 (a valid bound meaning "no limit") is accepted.
-  if (typeof timeBounds !== "object" || timeBounds.minTime === undefined || timeBounds.maxTime === undefined) {
-    return err(
-      SorokitErrorCode.VALIDATION,
-      "Time bounds must include minTime and maxTime",
-    );
-  }
-
-  const minTime = Number(timeBounds.minTime);
-  const maxTime = Number(timeBounds.maxTime);
-
-  if (!Number.isFinite(minTime) || !Number.isFinite(maxTime)) {
-    return err(
-      SorokitErrorCode.VALIDATION,
-      "Time bounds must contain numeric values",
-    );
-  }
-
-  if (minTime < 0 || maxTime < 0) {
-    return err(
-      SorokitErrorCode.VALIDATION,
-      "Time bounds must be non-negative integers",
-    );
-  }
-
-  // maxTime === 0 means "no upper bound". Only enforce minTime < maxTime when
-  // maxTime is a real deadline.
-  if (maxTime !== 0 && minTime >= maxTime) {
-    return err(
-      SorokitErrorCode.VALIDATION,
-      "minTime must be less than maxTime",
-    );
-  }
-
-  const fee = baseFee ? String(baseFee) : BASE_FEE;
-
-  try {
-    const builder = new TransactionBuilder(
-      {
-        id: () => source,
-        sequence: () => "1",
-        incrementSequenceNumber: () => {},
-      } as any,
-      {
-        fee,
-        networkPassphrase,
-        timebounds: {
-          minTime,
-          maxTime,
-        },
-      },
-    );
-
-    for (const operation of operations) {
-      builder.addOperation(operation);
-    }
-
-    const tx = builder.build();
-    return ok(tx.toEnvelope().toXDR("base64"));
-  } catch (error) {
-    return err(
-      SorokitErrorCode.TX_BUILD_FAILED,
-      `Failed to build time-locked transaction: ${String(error)}`,
-      error,
-    );
-  }
-}
-
-/**
- * Check if a time-locked transaction is eligible for execution.
- *
- * @param timeBounds - The time bounds from the transaction
- * @param currentTime - Current ledger close time (defaults to now)
- * @returns A SorokitResult containing execution eligibility details
- *
- * @example
- * const status = await getTimeLockedTransactionStatus(tx.timebounds);
- * if (status.status === "ok" && status.data.canExecute) {
- *   // Transaction is ready to execute
- * }
+ * Evaluate the execution status of a time-locked transaction at a given moment.
+ * Returns one of: "pending" | "executable" | "expired" | "invalid".
  */
 export function getTimeLockedTransactionStatus(
   timeBounds: TimeBounds,
-  currentTime?: number,
-): SorokitResult<TimeLockExecutionStatus> {
-  if (!timeBounds || typeof timeBounds !== "object") {
-    return err(
-      SorokitErrorCode.VALIDATION,
-      "Time bounds must be a valid object",
-    );
-  }
+  nowSeconds?: number,
+): TimeLockExecutionStatus {
+  if (!isValidTimeBounds(timeBounds)) return "invalid";
 
-  const minTime = Number(timeBounds.minTime);
-  const maxTime = Number(timeBounds.maxTime);
+  const now = nowSeconds ?? Date.now() / 1000;
 
-  if (isNaN(minTime) || isNaN(maxTime)) {
-    return err(
-      SorokitErrorCode.VALIDATION,
-      "Time bounds must contain valid numeric values",
-    );
-  }
-
-  const now = currentTime ?? Math.floor(Date.now() / 1000);
-
-  // maxTime === 0 means no upper bound (unbounded window).
-  const isUnbounded = maxTime === 0;
-  const canExecute = now >= minTime && (isUnbounded || now <= maxTime);
-  const timeUntilExecutable = Math.max(0, minTime - now);
-  const timeRemaining = isUnbounded ? Infinity : Math.max(0, maxTime - now);
-
-  let reason: string | undefined;
-  if (now < minTime) {
-    reason = `Transaction not yet executable. Wait ${timeUntilExecutable} seconds.`;
-  } else if (!isUnbounded && now > maxTime) {
-    reason = "Transaction window has expired.";
-  }
-
-  const status: TimeLockExecutionStatus = {
-    canExecute,
-    currentTime: now,
-    minTime,
-    maxTime,
-    timeUntilExecutable,
-    timeRemaining,
-    ...(reason ? { reason } : {}),
-  };
-
-  return ok(status);
+  if (timeBounds.minTime > 0 && now < timeBounds.minTime) return "pending";
+  if (timeBounds.maxTime !== 0 && now > timeBounds.maxTime) return "expired";
+  return "executable";
 }
 
 /**
- * Validate time bounds for correctness.
+ * Build an unsigned time-locked transaction XDR.
  *
- * @param timeBounds - The time bounds to validate
- * @returns A SorokitResult indicating validity
+ * Fetches the real account sequence from Horizon unless `options.sequence`
+ * is supplied, avoiding tx_bad_seq on submission.
+ *
+ * @param horizonUrl      - Base URL of the Horizon server.
+ * @param networkConfig   - Resolved network configuration.
+ * @param sourcePublicKey - G-address of the transaction source account.
+ * @param options         - Time bounds, optional pre-fetched sequence, optional fee.
  */
-export function validateTimeBounds(
-  timeBounds: TimeBounds,
-): SorokitResult<void> {
-  if (!timeBounds || typeof timeBounds !== "object") {
+export async function buildTimeLockTransaction(
+  horizonUrl: string,
+  networkConfig: ResolvedNetworkConfig,
+  sourcePublicKey: string,
+  options: TimeLockTransactionOptions,
+): Promise<SorokitResult<string>> {
+  const { timeBounds, sequence, fee } = options;
+
+  if (!isValidTimeBounds(timeBounds)) {
     return err(
-      SorokitErrorCode.VALIDATION,
-      "Time bounds must be a valid object",
+      SorokitErrorCode.TX_BUILD_FAILED,
+      `Invalid time bounds: minTime (${timeBounds.minTime}) must not exceed maxTime (${timeBounds.maxTime}) when maxTime is non-zero.`,
     );
   }
 
-  if (typeof timeBounds.minTime !== "number" || typeof timeBounds.maxTime !== "number") {
+  try {
+    let sourceAccount: Account;
+
+    if (sequence !== undefined) {
+      sourceAccount = new Account(sourcePublicKey, sequence);
+    } else {
+      const server = new Horizon.Server(horizonUrl);
+      const loaded = await server.loadAccount(sourcePublicKey);
+      sourceAccount = new Account(sourcePublicKey, loaded.sequenceNumber());
+    }
+
+    let builder = new TransactionBuilder(sourceAccount, {
+      fee: fee ?? BASE_FEE,
+      networkPassphrase: networkConfig.networkPassphrase,
+    }).addOperation(
+      Operation.bumpSequence({
+        bumpTo: sourceAccount.sequenceNumber(),
+      }),
+    );
+
+    if (timeBounds.maxTime !== 0) {
+      builder = builder.setTimebounds(timeBounds.minTime, timeBounds.maxTime);
+    } else if (timeBounds.minTime !== 0) {
+      builder = builder.setTimebounds(
+        timeBounds.minTime,
+        Math.floor(Date.now() / 1000) + DEFAULT_TX_TIMEOUT_SECONDS,
+      );
+    } else {
+      builder = builder.setTimeout(DEFAULT_TX_TIMEOUT_SECONDS);
+    }
+
+    const tx = builder.build();
+    return ok(tx.toXDR());
+  } catch (cause) {
     return err(
-      SorokitErrorCode.VALIDATION,
-      "minTime and maxTime must be numbers",
+      SorokitErrorCode.TX_BUILD_FAILED,
+      `Failed to build time-lock transaction: ${toMessage(cause)}`,
+      cause,
     );
   }
-
-  if (timeBounds.minTime < 0 || timeBounds.maxTime < 0) {
-    return err(
-      SorokitErrorCode.VALIDATION,
-      "Time bounds must be non-negative",
-    );
-  }
-
-  // maxTime === 0 means unbounded — skip the min < max check in that case.
-  if (timeBounds.maxTime !== 0 && timeBounds.minTime >= timeBounds.maxTime) {
-    return err(
-      SorokitErrorCode.VALIDATION,
-      "minTime must be less than maxTime",
-    );
-  }
-
-  return ok(undefined);
 }
